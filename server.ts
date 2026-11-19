@@ -871,7 +871,7 @@ const REQUIRED_TABLES = [
   'user_notifications',
 ] as const;
 
-async function startServer() {
+export async function createApp() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -5201,25 +5201,45 @@ async function startServer() {
     });
   }
 
-  // Serve Vite middleware in dev, or built dist in production
-  if (process.env.NODE_ENV === 'production') {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('/{*splat}', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  } else {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  // Vercel serves the Vite dist folder as static output. The Express app
+  // handles API requests only in serverless mode.
+  if (process.env.VERCEL !== '1') {
+    if (process.env.NODE_ENV === 'production') {
+      const distPath = path.join(__dirname, 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    } else {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ZentoPay server listening on http://0.0.0.0:${PORT}`);
-  });
+  return app;
 }
 
-startServer();
+// Reuse one initialized Express application across warm Vercel invocations.
+let appPromise: ReturnType<typeof createApp> | undefined;
+export function getApp() {
+  if (!appPromise) appPromise = createApp();
+  return appPromise;
+}
+
+// Keep the existing local development workflow: `npm run dev` runs this file.
+if (process.env.VERCEL !== '1') {
+  void getApp()
+    .then((app) => {
+      app.listen(PORT, '0.0.0.0', () => {
+        console.log(`ZentoPay server listening on http://0.0.0.0:${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error('[ZentoPay] Failed to start server:', error);
+      process.exitCode = 1;
+    });
+}
