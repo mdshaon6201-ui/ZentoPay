@@ -17,6 +17,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = process.env.NODE_ENV === 'production' ? Number(process.env.PORT || 3000) : 3000;
+const isVercelRuntime = Boolean(
+  process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME
+);
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
@@ -871,9 +876,56 @@ const REQUIRED_TABLES = [
   'user_notifications',
 ] as const;
 
-export async function createApp() {
+export function createApp() {
   const app = express();
+  app.set('trust proxy', 1);
+
+  // CORS & preflight handler so OPTIONS requests on /api/* never return 405
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+    next();
+  });
+
+  // Preserve pre-parsed request bodies in Serverless environments (e.g., Vercel Node runtime)
+  app.use((req, _res, next) => {
+    const rawReq = req as Request & { _body?: boolean };
+    if (req.body !== undefined && !rawReq._body) {
+      if (typeof req.body === 'string' && req.body.trim().length > 0) {
+        try {
+          req.body = JSON.parse(req.body);
+        } catch {
+          // Leave raw string if not valid JSON; json middleware/route validates cleanly
+        }
+      }
+      rawReq._body = true;
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '1mb' }));
+
+  app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (err instanceof SyntaxError && 'body' in err) {
+      return res.status(400).json({
+        configured: isServerConfigured,
+        code: 'INVALID_JSON',
+        error: 'অনুরোধের JSON ফরম্যাট সঠিক নয়।',
+      });
+    }
+    next(err);
+  });
 
   // Live Supabase health check endpoint (never exposes secrets or fakes success)
   app.get('/api/health', async (_req, res) => {
@@ -1064,6 +1116,7 @@ export async function createApp() {
   // Public registration endpoint: validates input, prevents duplicate accounts before hitting Supabase SMTP,
   // enforces server-side IP/email cooldown, logs exact upstream HTTP/error codes, and returns clear Bangla errors.
   app.post('/api/auth/register', async (req, res) => {
+    try {
     if (!isServerConfigured || !supabaseAdmin || !supabaseAnon) {
       return res.status(503).json({
         configured: false,
@@ -1369,10 +1422,19 @@ export async function createApp() {
         },
       },
     });
+    } catch (err) {
+      console.error('[auth/register] unexpected_error:', err);
+      return res.status(500).json({
+        configured: isServerConfigured,
+        code: 'INTERNAL_REGISTER_ERROR',
+        error: 'রেজিস্ট্রেশন প্রক্রিয়ায় সার্ভার ত্রুটি হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।',
+      });
+    }
   });
 
   // Public login endpoint: supports Bangladeshi phone number (primary) or email + password via real Supabase Auth
   app.post('/api/auth/login', async (req, res) => {
+    try {
     if (!isServerConfigured || !supabaseAdmin || !supabaseAnon) {
       return res.status(503).json({
         configured: false,
@@ -1501,6 +1563,14 @@ export async function createApp() {
         role: matchedProfile?.role || 'agent',
       },
     });
+    } catch (err) {
+      console.error('[auth/login] unexpected_error:', err);
+      return res.status(500).json({
+        configured: isServerConfigured,
+        code: 'INTERNAL_LOGIN_ERROR',
+        error: 'লগইন প্রক্রিয়ায় সার্ভার ত্রুটি হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।',
+      });
+    }
   });
 
   // Authenticated profile, wallets, transactions, settlements, KYC, tickets & gateways overview
@@ -4960,9 +5030,9 @@ export async function createApp() {
     }
   );
 
-  // Strictly Development-Only Endpoints (Blocked in production: returns 404)
+  // Strictly Development-Only Endpoints (Blocked in production & Vercel: returns 404)
   // Allows inspecting auth/profile role integrity and provisioning test Super Admin & Finance Admin accounts
-  if (process.env.NODE_ENV !== 'production') {
+  if (process.env.NODE_ENV !== 'production' && !isVercelRuntime) {
     const DEV_SUPER_ADMIN_EMAIL = (process.env.DEV_SUPER_ADMIN_EMAIL || 'superadmin@zentopay.dev').trim().toLowerCase();
     const DEV_SUPER_ADMIN_PASSWORD = process.env.DEV_SUPER_ADMIN_PASSWORD || 'ZentoSuper@2026!';
     const DEV_FINANCE_ADMIN_EMAIL = (process.env.DEV_FINANCE_ADMIN_EMAIL || 'financeadmin@zentopay.dev').trim().toLowerCase();
@@ -5201,45 +5271,71 @@ export async function createApp() {
     });
   }
 
-  // Vercel serves the Vite dist folder as static output. The Express app
-  // handles API requests only in serverless mode.
-  if (process.env.VERCEL !== '1') {
-    if (process.env.NODE_ENV === 'production') {
-      const distPath = path.join(__dirname, 'dist');
-      app.use(express.static(distPath));
-      app.get('*', (_req, res) => {
-        res.sendFile(path.join(distPath, 'index.html'));
-      });
-    } else {
-      const { createServer: createViteServer } = await import('vite');
-      const vite = await createViteServer({
-        server: { middlewareMode: true },
-        appType: 'spa',
-      });
-      app.use(vite.middlewares);
-    }
-  }
+  // Ensure unknown /api/* requests always return structured JSON 404 instead of SPA HTML or 405
+  app.use('/api', (req, res) => {
+    return res.status(404).json({
+      configured: isServerConfigured,
+      code: 'API_ROUTE_NOT_FOUND',
+      error: `API endpoint not found: ${req.method} ${req.originalUrl}`,
+    });
+  });
+
+  // Global Express JSON error fallback for serverless and standalone runtimes
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('[server] Unhandled API error:', err);
+    if (res.headersSent) return;
+    return res.status(500).json({
+      configured: isServerConfigured,
+      code: 'INTERNAL_SERVER_ERROR',
+      error: err instanceof Error ? err.message : 'সার্ভারে একটি অপ্রত্যাশিত ত্রুটি হয়েছে।',
+    });
+  });
 
   return app;
 }
 
-// Reuse one initialized Express application across warm Vercel invocations.
-let appPromise: ReturnType<typeof createApp> | undefined;
-export function getApp() {
-  if (!appPromise) appPromise = createApp();
-  return appPromise;
+const app = createApp();
+export default app;
+
+export async function getApp() {
+  return app;
 }
 
-// Keep the existing local development workflow: `npm run dev` runs this file.
-if (process.env.VERCEL !== '1') {
-  void getApp()
-    .then((app) => {
-      app.listen(PORT, '0.0.0.0', () => {
-        console.log(`ZentoPay server listening on http://0.0.0.0:${PORT}`);
-      });
-    })
-    .catch((error) => {
-      console.error('[ZentoPay] Failed to start server:', error);
-      process.exitCode = 1;
+export async function startServer(serverApp = app) {
+  // Serve Vite middleware in dev, or built dist in standalone production
+  if (process.env.NODE_ENV === 'production') {
+    const distPath = path.join(__dirname, 'dist');
+    serverApp.use(express.static(distPath));
+    serverApp.get('/{*splat}', (_req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
     });
+  } else {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    serverApp.use(vite.middlewares);
+  }
+
+  serverApp.listen(PORT, '0.0.0.0', () => {
+    console.log(`ZentoPay server listening on http://0.0.0.0:${PORT}`);
+  });
+}
+
+const isDirectExecution = (() => {
+  try {
+    const entryArg = process.argv[1];
+    if (!entryArg) return false;
+    return path.resolve(entryArg) === path.resolve(__filename);
+  } catch {
+    return false;
+  }
+})();
+
+if (!isVercelRuntime && isDirectExecution) {
+  startServer(app).catch((err) => {
+    console.error('[server] Fatal startup error:', err);
+    process.exit(1);
+  });
 }
