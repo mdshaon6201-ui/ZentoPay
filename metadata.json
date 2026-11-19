@@ -1,0 +1,6 @@
+{
+  "name": "ZentoPay",
+  "description": "Full-stack Digital Wallet, Payment Gateway, and Multi-Tier Agent Management Platform powered by Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
